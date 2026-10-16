@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>자동차 게임</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+  canvas{display:block;width:100%;height:100%}
+  #hud{position:fixed;top:0;left:0;right:0;padding:10px;text-align:center;font-size:20px;font-weight:700;background:rgba(0,0,0,.55)}
+  #status{position:fixed;top:44px;left:0;right:0;padding:6px;text-align:center;font-size:18px;background:rgba(0,0,0,.5)}
+  #ctrl{position:fixed;bottom:0;left:0;right:0;display:grid;grid-template-columns:repeat(5,1fr);gap:6px;padding:6px}
+  #ctrl button{height:96px;font-size:20px;font-weight:700;border:0;border-radius:14px;background:#2b2b2b;color:#fff}
+  #ctrl button.on{background:#ffb300;color:#000}
+  #ctrl button:focus-visible,#startBtn:focus-visible{outline:4px solid #fff;outline-offset:2px}
+  #start{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;line-height:1.7;font-size:20px}
+  #start h1{margin:0 0 8px;font-size:34px}
+  #start p{margin:4px 0;max-width:600px}
+  #startBtn{margin-top:22px;font-size:28px;font-weight:700;padding:18px 44px;border-radius:16px;border:0;background:#ffb300;color:#000}
+</style>
+</head>
+<body>
+<canvas id="cv" aria-hidden="true"></canvas>
+<div id="hud" aria-hidden="true">스테이지 1</div>
+<div id="status" role="status" aria-live="assertive"></div>
+
+<div id="ctrl">
+  <button data-k="d" aria-label="왼쪽">왼쪽</button>
+  <button data-k="s" aria-label="후진">후진</button>
+  <button data-k="g" aria-label="브레이크">브레이크</button>
+  <button data-k="a" aria-label="엑셀">엑셀</button>
+  <button data-k="f" aria-label="오른쪽">오른쪽</button>
+</div>
+
+<div id="start" role="dialog" aria-live="polite">
+  <h1 id="title">자동차 게임</h1>
+  <p id="info">엑셀 A(누르는 동안 가속, 떼면 서서히 느려짐), 뒤로 S, 왼쪽 D, 오른쪽 F, 브레이크 G(확 멈춤)</p>
+  <p id="info2">스테이지 하나가 1000미터입니다. 갈수록 횡단보도, 신호등, 어린이 보호구역, 고가도로 같은 길이 차례로 나옵니다. 부딪히면 패배하고, R 키는 그 스테이지 처음부터, T 키는 맨 처음부터 다시 합니다. 기울기를 다시 설정하려면 C 키를 누르세요.</p>
+  <button id="startBtn">시작</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const hud = $('hud'), startEl = $('start'), startBtn = $('startBtn');
+let W = 0, H = 0, cxs = new Float32Array(1);
+function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; cxs = new Float32Array(H + 1); }
+addEventListener('resize', resize); resize();
+const clamp = (a, lo, hi) => Math.max(lo, Math.min(hi, a));
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* =====================================================================
+   스테이지 설정 (한 스테이지 = 1000미터)
+   ===================================================================== */
+const KMH = 2.5;        // 화면 속도(km/h) = v * 2.5
+const MAXV = 60;
+const STAGES = [
+  { n:'연습 도로',       amp:.45, intro:'연습 도로입니다. 길을 따라 달려 보세요.' },
+  { n:'횡단보도',        amp:.5,  cross:[250,550,850], intro:'횡단보도 구간입니다. 보행자가 건너면 멈추세요.' },
+  { n:'시내 신호등',     amp:.5,  lights:[300,650], cross:[900], intro:'시내입니다. 빨간불에는 멈추세요.' },
+  { n:'어린이 보호구역', amp:.5,  child:true, cross:[300,600,850], zone:{from:80,to:920,kmh:30,kind:'school',label:'어린이 보호구역'}, intro:'어린이 보호구역입니다. 시속 30킬로미터 이하로 달리세요.' },
+  { n:'고가도로',        amp:.6,  over:{from:120,to:900}, intro:'고가도로입니다. 옆바람과 이음매를 조심하세요.' },
+  { n:'공사 구간',       amp:.55, width:.65, cones:true, zone:{from:80,to:920,kmh:60,kind:'work',label:'공사 구간'}, intro:'공사 구간입니다. 길이 좁고 시속 60킬로미터 제한입니다.' },
+  { n:'비 오는 길',      amp:.7,  rain:true, grip:.65, intro:'비가 옵니다. 길이 미끄러우니 천천히 달리세요.' },
+  { n:'터널',            amp:.4,  width:.8, tunnel:{from:100,to:900}, stalled:3, intro:'터널입니다. 멈춰 있는 차를 조심하세요.' },
+  { n:'굽이 산길',       amp:1.25, wave:.65, intro:'굽이 산길입니다. 급한 커브가 이어집니다.' },
+  { n:'고속도로',        amp:.5,  traffic:8, intro:'고속도로입니다. 느린 차를 피해 추월하세요.' },
+  { n:'빙판길',          amp:.65, ice:true, grip:.45, intro:'빙판길입니다. 핸들과 브레이크가 잘 듣지 않습니다.' },
+  { n:'종합 코스',       amp:.9,  grip:.7, rain:true, cross:[200,700], lights:[450], zone:{from:520,to:850,kmh:30,kind:'school',label:'어린이 보호구역'}, traffic:3, intro:'마지막 종합 코스입니다. 지금까지 만난 길이 모두 나옵니다.' },
+];
+const cfgCache = {};
+function cfgOf(k){
+  if (cfgCache[k]) return cfgCache[k];
+  let c;
+  if (k <= STAGES.length) c = STAGES[k - 1];
+  else {
+    const base = STAGES[1 + ((k - STAGES.length - 1) % (STAGES.length - 1))];
+    c = Object.assign({}, base, {
+      amp: Math.min(1.5, base.amp * (1 + .08 * (k - STAGES.length))),
+      intro: '끝없는 길 스테이지 ' + k + ', ' + base.n + '입니다. ' + base.intro
+    });
+  }
+  return (cfgCache[k] = c);
+}
+const stageAt = zz => Math.floor(zz / 1000) + 1;
+const maxHearts = k => k >= 9 ? 4 : k >= 5 ? 3 : 2;      // 스테이지 1~4: 2개, 5~8: 3개, 9~: 4개
+
+/* ---------- 상태 ---------- */
+let state = 'ready';            // ready | starting | calib | play | crashed
+let z = 0, x = 0, v = 0, prevV = 0, tilt = 0, seed1 = 0, seed2 = 0, gameT = 0;
+let curStage = 1, nextStart = 1, builtUpTo = 0, lastMk = 0;
+let engineOn = false, startT = 0, shiftT = 0, gear = 0;
+let warnT = 0, curveT = 0, backT = 0, brakeVibT = 0, lastS = 0, steerNow = 0, braking = false, lastTB = false, keySteer = 0;
+let overT = 0, limT = 0, limSayT = 0, gustT = 3, thunderT = 10, kidT = 1, hamT = 1, lastJn = 0, hearts = 2, invT = 0;
+const gust = { on:false, t:0, d:1 };
+const fx = { rain:false, ice:false, echo:0, gust:0, gustPan:0, dark:0 };
+let crosswalks = [], lights = [], obstacles = [], segs = [];
+const inp = { a:0, s:0, d:0, f:0, g:0 };
+const KEYMAP = { KeyA:'a', KeyS:'s', KeyD:'d', KeyF:'f', KeyG:'g' };
+
+/* ---------- 길 곡률 (양수 = 오른쪽 커브) ---------- */
+function curveAt(zz){
+  if (zz < 0) return 0;
+  const k = stageAt(zz), c = cfgOf(k), loc = zz - (k - 1) * 1000;
+  let amp = c.amp;
+  if (k > 1 && loc < 80){ const pa = cfgOf(k - 1).amp; amp = pa + (c.amp - pa) * (loc / 80); }
+  const w = c.wave || 1;
+  const ramp = Math.max(0, Math.min(1, (zz - 100) / 200));
+  return (0.6 * Math.sin(zz / (170 * w) + seed1) + 0.4 * Math.sin(zz / (61 * w) + seed2)) * amp * ramp;
+}
+
+/* =====================================================================
+   길 위의 것들 만들기
+   ===================================================================== */
+function buildStage(k){
+  const c = cfgOf(k), base = (k - 1) * 1000;
+  if (c.cross) for (const o of c.cross)
+    crosswalks.push({ z:base + o, active:Math.random() < (c.child ? .85 : .7), child:!!c.child, st:0, t:0, dir:1, ann:false, sT:0, bT:0 });
+  if (c.lights) for (const o of c.lights)
+    lights.push({ z:base + o, off:Math.random() * 14, ann:false, last:'', t:0, pz:-1e9 });
+  if (c.zone) segs.push({ a:base + c.zone.from, b:base + c.zone.to, kind:c.zone.kind, kmh:c.zone.kmh, v:c.zone.kmh / KMH, label:c.zone.label, in:false });
+  if (c.over) segs.push({ a:base + c.over.from, b:base + c.over.to, kind:'over', in:false });
+  if (c.tunnel) segs.push({ a:base + c.tunnel.from, b:base + c.tunnel.to, kind:'tunnel', in:false });
+  const n = (c.traffic || 0) + (c.stalled || 0);
+  if (n){
+    let lz = 120, tr = c.traffic || 0, st = c.stalled || 0, i = 0;
+    while (tr + st > 0){
+      lz += rnd(65, 115); if (lz > 950) break;
+      const lane = (i++ % 2) ? .5 : -.5;
+      const moving = tr > 0 && (st === 0 || Math.random() < .6);
+      if (moving){ tr--; obstacles.push({ z:base + lz, x:lane + rnd(-.08, .08), v:rnd(16, 26), w:.2, kind:'car', beacon:true, t:0 }); }
+      else { st--; obstacles.push({ z:base + lz, x:lane + rnd(-.08, .08), v:0, w:.22, kind:'stalled', beacon:true, t:0 }); }
+    }
+  }
+  if (c.cones){
+    for (let i = 0; i < 5; i++){
+      const zz = base + 160 + i * 150 + rnd(-20, 20), side = Math.random() < .5 ? -.5 : .5;
+      for (let j = 0; j < 3; j++) obstacles.push({ z:zz + j * 6, x:side, v:0, w:.1, kind:'cone', beacon:j === 0, t:0 });
+    }
+  }
+}
+
+/* =====================================================================
+   소리
+   ===================================================================== */
+let AC = null, master = null, noiseBuf = null, sq = null, sqG = null, echoWet = null;
+const eng = {}, nz = {};
+
+function mkOsc(type){ const o = AC.createOscillator(); o.type = type; o.frequency.value = 60; o.start(); return o; }
+function mkNoise(type, freq, Q, panned){
+  const src = AC.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+  const f = AC.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = Q;
+  const g = AC.createGain(); g.gain.value = 0;
+  src.connect(f); f.connect(g);
+  let p = null;
+  if (panned && AC.createStereoPanner){ p = AC.createStereoPanner(); g.connect(p); p.connect(master); }
+  else g.connect(master);
+  src.start(0, Math.random() * 1.5);
+  return { f, g, p };
+}
+function initAudio(){
+  if (AC) return;
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  const comp = AC.createDynamicsCompressor();
+  master = AC.createGain(); master.gain.value = .9;
+  master.connect(comp); comp.connect(AC.destination);
+
+  // 메아리 (터널, 고가도로에서만 켜짐)
+  const dl = AC.createDelay(1); dl.delayTime.value = .13;
+  const fb = AC.createGain(); fb.gain.value = .4;
+  echoWet = AC.createGain(); echoWet.gain.value = 0;
+  master.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(echoWet); echoWet.connect(comp);
+
+  const len = AC.sampleRate * 2;
+  noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+  // 엔진: 톱니파 2개(살짝 어긋나게) + 한 옥타브 아래 사각파
+  eng.o1 = mkOsc('sawtooth'); eng.o2 = mkOsc('sawtooth'); eng.o3 = mkOsc('square');
+  const m1 = AC.createGain(), m2 = AC.createGain(), m3 = AC.createGain();
+  m1.gain.value = .5; m2.gain.value = .4; m3.gain.value = .45;
+  eng.lp = AC.createBiquadFilter(); eng.lp.type = 'lowpass'; eng.lp.Q.value = 1.2; eng.lp.frequency.value = 600;
+  eng.g = AC.createGain(); eng.g.gain.value = 0;
+  eng.o1.connect(m1); eng.o2.connect(m2); eng.o3.connect(m3);
+  m1.connect(eng.lp); m2.connect(eng.lp); m3.connect(eng.lp);
+  eng.lp.connect(eng.g); eng.g.connect(master);
+
+  nz.road    = mkNoise('bandpass', 300, .6, false);   // 바퀴 구르는 소리
+  nz.wind    = mkNoise('bandpass', 900, .5, false);   // 바람 소리
+  nz.wall    = mkNoise('bandpass', 700, 1.2, true);   // 벽이 스쳐가는 소리 (벽 쪽 귀)
+  nz.screech = mkNoise('bandpass', 2200, 3, false);   // 브레이크 마찰음
+  nz.turn    = mkNoise('bandpass', 1400, 6, true);    // 급커브 타이어 소리
+  nz.rain    = mkNoise('bandpass', 5200, .35, false); // 빗소리
+  nz.gust    = mkNoise('bandpass', 450, .8, true);    // 옆바람
+
+  sq = AC.createOscillator(); sq.type = 'triangle'; sq.frequency.value = 1500;
+  sqG = AC.createGain(); sqG.gain.value = 0;
+  sq.connect(sqG); sqG.connect(master); sq.start();
+}
+function beep(f, d, pan, type, vol){
+  if (!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime;
+  o.type = type || 'sine'; o.frequency.value = f;
+  g.gain.setValueAtTime(vol || .3, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + d);
+  o.connect(g);
+  if (AC.createStereoPanner){
+    const p = AC.createStereoPanner(); p.pan.value = clamp(pan || 0, -1, 1);
+    g.connect(p); p.connect(master);
+  } else g.connect(master);
+  o.start(t); o.stop(t + d + .02);
+}
+function jingle(notes, step, type, vol){
+  notes.forEach((f, i) => setTimeout(() => beep(f, step * 1.5, 0, type || 'sine', vol || .35), i * step * 1000));
+}
+function crashSound(){
+  if (!AC) return;
+  const len = AC.sampleRate * 0.8, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 2);
+  const s = AC.createBufferSource(), g = AC.createGain();
+  s.buffer = buf; g.gain.value = 1; s.connect(g); g.connect(master); s.start();
+  beep(70, .5, 0, 'sine', .8);
+}
+function thunder(){
+  if (!AC) return;
+  const t = AC.currentTime;
+  const s = AC.createBufferSource(), lp = AC.createBiquadFilter(), g = AC.createGain();
+  s.buffer = noiseBuf; lp.type = 'lowpass'; lp.frequency.value = 170;
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(1.1, t + .12); g.gain.exponentialRampToValueAtTime(.001, t + 2);
+  s.connect(lp); lp.connect(g); g.connect(master); s.start(t, Math.random()); s.stop(t + 2.1);
+  vib([150, 60, 150]);
+}
+const VL = [40], VR = [40, 60, 40];     // 왼쪽 = 짧게 1번, 오른쪽 = 짧게 2번
+function vib(p){ if (navigator.vibrate) navigator.vibrate(p); }
+
+/* ---------- 음성 안내 (소리 + 화면 글자 둘 다) ---------- */
+let sayQ = [], speaking = false;
+function nextSay(){
+  const t = sayQ.shift();
+  if (!t){ speaking = false; return; }
+  speaking = true;
+  const u = new SpeechSynthesisUtterance(t); u.lang = 'ko-KR';
+  u.onend = u.onerror = () => nextSay();
+  speechSynthesis.speak(u);
+}
+function say(t){                                   // 순서대로 읽기
+  $('status').textContent = t;
+  if (!window.speechSynthesis) return;
+  if (sayQ.length >= 3) sayQ.shift();
+  sayQ.push(t);
+  if (!speaking) nextSay();
+}
+function sayIdle(t){ if (!speaking && sayQ.length === 0) say(t); }
+function speak(t){                                 // 급한 안내: 하던 말을 끊고 바로 읽기
+  $('status').textContent = t;
+  if (!window.speechSynthesis) return;
+  sayQ = []; speaking = false;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(t); u.lang = 'ko-KR';
+  speaking = true; u.onend = u.onerror = () => nextSay();
+  speechSynthesis.speak(u);
+}
+function steerFx(dir){ beep(dir < 0 ? 440 : 560, .07, dir, 'sine', .35); vib(dir < 0 ? VL : VR); }
+
+// 매 프레임: 엔진/바퀴/바람/브레이크/날씨 소리를 현재 상황에 맞춰 조절
+function updateAudio(dt){
+  if (!AC) return;
+  const t = AC.currentTime, av = Math.abs(v), vf = Math.min(av / MAXV, 1);
+  const T = (p, val, tau) => p.setTargetAtTime(val, t, tau || .06);
+
+  if (!(state === 'play' && engineOn)){
+    T(eng.g.gain, 0, .15);
+    for (const k in nz) T(nz[k].g.gain, 0, .15);
+    T(sqG.gain, 0, .1); T(echoWet.gain, 0, .2);
+    return;
+  }
+
+  const gv = [0, 12, 24, 38, 50, 61];
+  let gi = 0; for (let i = 0; i < 5; i++) if (av >= gv[i]) gi = i;
+  if (gi !== gear){ shiftT = .14; gear = gi; if (av > 1) beep(140, .05, 0, 'square', .18); }
+  const r = Math.min(1, (av - gv[gi]) / (gv[gi+1] - gv[gi]));
+
+  let f = 60 + gi * 7 + r * 115;
+  let amp = .16 + (inp.a ? .16 : 0) + r * .1;
+  if (startT > 0){
+    startT -= dt;
+    const k = clamp(1 - startT / 1, 0, 1);
+    f = 22 + (60 - 22) * k;
+    amp *= .6 + .4 * Math.sin(startT * 70);
+  }
+  if (shiftT > 0){ shiftT -= dt; amp *= .45; }
+  T(eng.o1.frequency, f, .07); T(eng.o2.frequency, f * 1.006, .07); T(eng.o3.frequency, f * .5, .07);
+  T(eng.lp.frequency, 450 + r * 1100 + (inp.a ? 900 : 0) + gi * 120, .08);
+  T(eng.g.gain, amp, .05);
+
+  T(nz.road.g.gain, vf * .22, .1);  T(nz.road.f.frequency, 200 + vf * 400, .1);
+  T(nz.wind.g.gain, vf * vf * .2 * (fx.ice ? 1.8 : 1), .1); T(nz.wind.f.frequency, 700 + vf * 900, .1);
+  T(nz.rain.g.gain, fx.rain ? .16 : 0, .4);
+  T(nz.gust.g.gain, fx.gust * .55, .05); if (nz.gust.p) T(nz.gust.p.pan, fx.gustPan, .05);
+  T(echoWet.gain, fx.echo * .38, .3);
+
+  const d = Math.abs(x);
+  const w = d > .4 ? Math.pow((d - .4) / .55, 2) * .5 * (.3 + .7 * vf) : 0;
+  if (nz.wall.p) T(nz.wall.p.pan, Math.sign(x) * .9, .03);
+  T(nz.wall.g.gain, w, .05);
+
+  const br = (braking && v > 6) ? Math.min(1, v / 30) : 0;
+  T(sqG.gain, br * .12, .04); T(sq.frequency, 1100 + vf * 900, .05);
+  T(nz.screech.g.gain, br * .2, .04);
+
+  const st = Math.abs(steerNow) * Math.max(0, v) / MAXV;
+  T(nz.turn.g.gain, Math.max(0, st - .45) * .6, .05);
+  if (nz.turn.p) T(nz.turn.p.pan, steerNow * .6, .05);
+}
+
+/* ---------- 입력 ---------- */
+function setInp(k, val){
+  if (val && !inp[k] && k === 'g' && state === 'play' && Math.abs(v) > 8){
+    beep(150, .1, 0, 'square', .35); vib([60]);       // 브레이크를 꽉 잡는 느낌
+  }
+  inp[k] = val;
+  const b = document.querySelector('#ctrl button[data-k="'+k+'"]');
+  if (b) b.classList.toggle('on', !!val);
+}
+addEventListener('keydown', e => {
+  if (state === 'calib'){ e.preventDefault(); skipCalib(); return; }
+  if (state === 'starting') return;
+  if ((state === 'ready' || state === 'crashed') && e.code === 'KeyC'){
+    e.preventDefault();
+    try { localStorage.removeItem('carGameCfg'); } catch (er) {}
+    sensor.ready = false; sensor.cfg = null; sensor.tried = false;
+    begin(); return;
+  }
+  if (state === 'crashed' && e.code === 'KeyT'){ e.preventDefault(); nextStart = 1; begin(); return; }
+  if (state !== 'play'){
+    if (state === 'ready' && e.code !== 'Tab') { e.preventDefault(); begin(); }
+    else if (state === 'crashed' && (e.code === 'Enter' || e.code === 'KeyR' || e.code === 'Space')) { e.preventDefault(); begin(); }
+    return;
+  }
+  const k = KEYMAP[e.code];
+  if (!k) return;
+  e.preventDefault();
+  if (!e.repeat) setInp(k, 1);
+});
+addEventListener('keyup', e => { const k = KEYMAP[e.code]; if (k) setInp(k, 0); });
+addEventListener('blur', () => { for (const k in inp) setInp(k, 0); });
+
+document.querySelectorAll('#ctrl button').forEach(b => {
+  const k = b.dataset.k;
+  b.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (state === 'calib') skipCalib();
+    else if (state === 'play') setInp(k, 1);
+  });
+  ['pointerup','pointerleave','pointercancel'].forEach(ev => b.addEventListener(ev, () => setInp(k, 0)));
+});
+
+/* ---------- 기울기 (한소네·휴대폰·센서 있는 PC) ---------- */
+// 채널 0:방향센서 좌우, 1:방향센서 앞뒤, 2:가속도센서 좌우, 3:가속도센서 앞뒤 (도 단위)
+const FAM = [0, 1, 0, 1];
+const sensor = { seen:false, ready:false, tried:false, cfg:null, ch:[0,0,0,0], base:[0,0,0,0], backAmt:0, lastB:0, lastT:0, flickUntil:0 };
+function applySensor(){
+  const c = sensor.cfg;
+  if (!sensor.ready || !c) return;
+  let tt = (sensor.ch[c.si] - sensor.base[c.si]) * c.ss / c.sscale;
+  if (Math.abs(tt) < .1) tt = 0;
+  tilt = clamp(tt, -1, 1);
+  if (c.bi >= 0){
+    const bv = (sensor.ch[c.bi] - sensor.base[c.bi]) * c.bs;      // 뒤로 젖힐수록 +
+    const now = performance.now();
+    const rate = (bv - sensor.lastB) / Math.max(.001, (now - sensor.lastT) / 1000);
+    sensor.lastB = bv; sensor.lastT = now; sensor.backAmt = bv;
+    if (bv > 5 && rate > 110) sensor.flickUntil = now + 700;      // 확 젖히면 잠깐 브레이크
+  }
+}
+addEventListener('deviceorientation', e => {
+  if (e.gamma == null && e.beta == null) return;
+  sensor.seen = true; sensor.ch[0] = e.gamma || 0; sensor.ch[1] = e.beta || 0; applySensor();
+});
+addEventListener('devicemotion', e => {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  sensor.seen = true;
+  const R = 180 / Math.PI;
+  sensor.ch[2] = Math.atan2(a.x, Math.hypot(a.y, a.z)) * R;
+  sensor.ch[3] = Math.atan2(a.y, Math.hypot(a.x, a.z)) * R;
+  applySensor();
+});
+function loadCfg(){ try { const c = JSON.parse(localStorage.getItem('carGameCfg')); if (c && typeof c.si === 'number') sensor.cfg = c; } catch (e) {} }
+function saveCfg(c){ try { localStorage.setItem('carGameCfg', JSON.stringify(c)); } catch (e) {} }
+
+let calibResolve = null, calibIv = null;
+function skipCalib(){
+  if (calibIv){ clearInterval(calibIv); calibIv = null; }
+  if (calibResolve){ const r = calibResolve; calibResolve = null; r(false); }
+}
+function calibrate(){
+  return new Promise(resolve => {
+    calibResolve = resolve; state = 'calib';
+    speak('기울기를 설정합니다. 기기를 가만히 들어주세요.');
+    beep(500, .15, 0, 'sine', .5);
+    let base = null, phase = 0;
+    const pk = [0,0,0,0], pk2 = [0,0,0,0];
+    const t0 = performance.now();
+    calibIv = setInterval(() => {
+      const t = performance.now() - t0;
+      const d = base ? sensor.ch.map((c, i) => c - base[i]) : [0,0,0,0];
+      if (phase === 0 && t > 3500){
+        base = sensor.ch.slice(); phase = 1;
+        speak('왼쪽으로 기울여 주세요.');
+        beep(800, .15, -1, 'sine', .5); setTimeout(() => beep(800, .15, -1, 'sine', .5), 250);
+      } else if (phase === 1){
+        for (let i = 0; i < 4; i++) if (Math.abs(d[i]) > Math.abs(pk[i])) pk[i] = d[i];
+        if (t > 7500){
+          phase = 2;
+          speak('이번에는 기기를 뒤로 확 젖혔다가 제자리로 돌려주세요.');
+          beep(700, .15, 0, 'sine', .5); setTimeout(() => beep(700, .15, 0, 'sine', .5), 250); setTimeout(() => beep(700, .15, 0, 'sine', .5), 500);
+        }
+      } else if (phase === 2){
+        for (let i = 0; i < 4; i++) if (Math.abs(d[i]) > Math.abs(pk2[i])) pk2[i] = d[i];
+        if (t > 11500){
+          clearInterval(calibIv); calibIv = null; calibResolve = null;
+          beep(1000, .25, 0, 'sine', .5);
+          let si = 0; for (let i = 1; i < 4; i++) if (Math.abs(pk[i]) > Math.abs(pk[si])) si = i;
+          if (Math.abs(pk[si]) < 8){ sensor.ready = false; resolve(false); return; }
+          const cfg = { si, ss: pk[si] > 0 ? -1 : 1, sscale: clamp(Math.abs(pk[si]), 12, 35) * .8, bi: -1, bs: 1, bth: 12 };
+          let bi = -1;
+          for (let i = 0; i < 4; i++) if (FAM[i] !== FAM[si] && (bi < 0 || Math.abs(pk2[i]) > Math.abs(pk2[bi]))) bi = i;
+          if (bi >= 0 && Math.abs(pk2[bi]) >= 8){ cfg.bi = bi; cfg.bs = pk2[bi] > 0 ? 1 : -1; cfg.bth = clamp(Math.abs(pk2[bi]) * .5, 8, 25); }
+          sensor.cfg = cfg; sensor.base = base; sensor.ready = true; sensor.backAmt = 0;
+          saveCfg(cfg); resolve(true);
+        }
+      }
+    }, 50);
+  });
+}
+
+/* =====================================================================
+   게임 흐름
+   ===================================================================== */
+function resetGame(){
+  curStage = nextStart; z = (curStage - 1) * 1000; x = 0; v = 0; prevV = 0; gameT = 0;
+  hearts = maxHearts(curStage); invT = 0;
+  seed1 = Math.random() * 6.28; seed2 = Math.random() * 6.28;
+  crosswalks = []; lights = []; obstacles = []; segs = []; builtUpTo = curStage - 1;
+  warnT = 0; curveT = 0; backT = 0; brakeVibT = 0; gear = 0; shiftT = 0; lastS = 0; steerNow = 0; keySteer = 0;
+  braking = false; lastTB = false; sensor.backAmt = 0; sensor.flickUntil = 0;
+  overT = 0; limT = 0; limSayT = 0; gustT = 3; thunderT = 8; kidT = 1; hamT = 1; lastJn = Math.floor(z / 25); lastMk = 0;
+  gust.on = false; fx.gust = 0; fx.echo = 0; fx.dark = 0;
+  for (const k in inp) setInp(k, 0);
+}
+async function begin(){
+  if (state === 'play' || state === 'calib' || state === 'starting') return;
+  state = 'starting';
+  try { initAudio(); }
+  catch (e) {
+    state = 'ready';
+    $('status').textContent = '이 기기의 브라우저에서 소리를 쓸 수 없습니다. 크롬 같은 다른 브라우저로 열어 주세요.';
+    return;
+  }
+  try { await AC.resume(); } catch (e) {}
+  beep(660, .25, 0, 'sine', .5);                     // 소리 확인음
+  $('status').textContent = '소리 상태: ' + AC.state + (window.speechSynthesis ? ' / 음성 안내 가능' : ' / 음성 안내 불가(효과음만 사용)');
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+    try { await DeviceOrientationEvent.requestPermission(); } catch (e) {}
+  }
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+    try { await DeviceMotionEvent.requestPermission(); } catch (e) {}
+  }
+  startEl.style.display = 'none';
+  if (!sensor.tried){
+    sensor.tried = true;
+    loadCfg();
+    await wait(800);
+    if (!sensor.seen){
+      speak('기울기 센서를 읽지 못했습니다. 키나 버튼으로 운전하세요.');
+      $('status').textContent = '기울기 센서 값이 들어오지 않습니다.' + (window.isSecureContext === false ? ' 보안 연결이 아니라 센서가 막혔을 수 있습니다.' : '') + ' D 왼쪽, F 오른쪽 키로 운전하세요.';
+      await wait(1500);
+    } else if (sensor.cfg){
+      speak('기준을 잡습니다. 기기를 가만히 들어주세요.');
+      await wait(2500);
+      sensor.base = sensor.ch.slice(); sensor.ready = true; sensor.backAmt = 0;
+    } else {
+      const ok = await calibrate();
+      state = 'starting';
+      speak(ok ? '설정이 끝났습니다.' : '기울기를 사용하지 않습니다. 키나 버튼으로 운전하세요.');
+      await wait(1800);
+    }
+  }
+  resetGame();
+  engineOn = true; startT = 1;
+  vib([60, 40, 60]);
+  state = 'play';
+  say('스테이지 ' + curStage + ', ' + cfgOf(curStage).n + '. ' + cfgOf(curStage).intro + ' 하트는 ' + hearts + '개입니다.');
+}
+startBtn.addEventListener('click', begin);
+startBtn.focus();
+
+function crash(reason){
+  state = 'crashed'; engineOn = false;
+  const st = stageAt(z), loc = Math.floor(z - (st - 1) * 1000), m = Math.floor(z);
+  nextStart = curStage;
+  v = 0;
+  crashSound(); vib([400]);
+  let best = 0;
+  try { best = Number(localStorage.getItem('carBest') || 0); if (m > best){ localStorage.setItem('carBest', String(m)); } } catch (e) {}
+  $('title').textContent = '패배';
+  $('info').textContent = reason + ' 스테이지 ' + st + '(' + cfgOf(st).n + '), 이 스테이지 ' + loc + '미터, 전체 ' + m + '미터.' + (m > best ? ' 새 기록!' : '');
+  $('info2').textContent = 'R 키나 Enter: 이 스테이지 처음부터. T 키: 맨 처음부터. 아래 버튼은 이 스테이지부터 다시 시작합니다.';
+  startBtn.textContent = '다시 시작';
+  startEl.style.display = 'flex';
+  speak(reason + ' 패배. 스테이지 ' + st + ', ' + loc + '미터. 알 키나 엔터는 이 스테이지부터, 티 키는 처음부터 다시 합니다.');
+  startBtn.focus();
+}
+
+// 사고가 나면 하트가 하나 줄고, 하트가 없으면 패배. 사고 뒤 3초 동안은 무적.
+function hit(reason, fix){
+  if (invT > 0) return false;
+  hearts--;
+  if (hearts <= 0){ crash(reason); return true; }
+  v = 0; x = 0; invT = 3; overT = 0; gust.on = false; fx.gust = 0;
+  if (fix) fix();
+  crashSound(); vib([300]);
+  speak(reason + ' 하트가 ' + hearts + '개 남았습니다.');
+  return true;
+}
+
+function stageClear(prev){
+  jingle([523, 659, 784, 1047], .13, 'triangle', .45);
+  vib([80, 50, 80]);
+  if (prev === STAGES.length) say('모든 스테이지를 완료했습니다! 지금부터는 끝없는 길입니다.');
+  else say('스테이지 ' + prev + ' 완료. 다음은 스테이지 ' + (prev + 1) + ', ' + cfgOf(prev + 1).n + '. ' + cfgOf(prev + 1).intro + ' 하트 ' + hearts + '개.');
+}
+
+/* =====================================================================
+   업데이트
+   ===================================================================== */
+function pedStep(q, dt, dz){
+  if (!q.on){ if (dz < q.startDz) q.on = true; else return; }
+  if (q.done) return;
+  q.t += dt;
+  if (q.pause > 0){ q.pause -= dt; return; }
+  let spd = q.s0 * (.75 + .5 * Math.sin(q.t * q.f1 + q.ph));      // 걸음이 빨랐다 느렸다
+  if (q.dash > 0){ q.dash -= dt; spd *= 2.1; }                      // 갑자기 뛰기
+  if (q.t < q.tMax){
+    const inRoad = Math.abs(q.p) < 1.2 && q.t > .6;
+    if (inRoad && q.pauses < 3 && Math.random() < dt * .45){ q.pause = rnd(.5, 1.8); q.pauses++; }          // 길 한가운데서 멈춤
+    if (!q.turned && Math.abs(q.p) < 1.0 && Math.random() < dt * .22){ q.dir = -q.dir; q.turned = true; }   // 갑자기 돌아섬
+    if (q.dash <= 0 && Math.random() < dt * .25) q.dash = rnd(.6, 1.2);
+  } else spd = Math.max(spd, .7);                                   // 너무 오래 걸리면 서둘러 건넘
+  q.p += q.dir * spd * dt;
+  if (Math.abs(q.p) < 1.15) q.entered = true;
+  if (q.entered && Math.abs(q.p) > 1.65) q.done = true;
+}
+const lightState = l => ((gameT + l.off) % 14) < 7 ? 'red' : 'green';
+
+function update(dt){
+  gameT += dt;
+  if (invT > 0) invT -= dt;
+  prevV = v;
+  const stg = stageAt(z), cfg = cfgOf(stg);
+  const G = cfg.grip || 1, Wf = cfg.width || 1;
+  while (builtUpTo * 1000 < z + 400) buildStage(++builtUpTo);
+
+  /* --- 속도: 엑셀 / 엑셀 뗌 / 브레이크 --- */
+  const tb = !!(sensor.ready && sensor.cfg && sensor.cfg.bi >= 0 && (sensor.backAmt > sensor.cfg.bth || performance.now() < sensor.flickUntil));
+  if (tb && !lastTB && v > 8){ beep(150, .1, 0, 'square', .35); vib([60]); }
+  lastTB = tb;
+  const hard = inp.g || tb;                                   // 브레이크: g 키 또는 뒤로 확 젖힘
+  braking = hard;
+  if (hard){ v -= Math.sign(v) * Math.min(Math.abs(v), 55 * G * dt); }                    // 브레이크: 확 선다
+  else if (inp.a || inp.s){ const ac = 18 * (.5 + .5 * G) * dt; if (inp.a) v += ac; if (inp.s) v -= ac; }   // 엑셀: 가속
+  else { v -= Math.sign(v) * Math.min(Math.abs(v), 12 * dt); }                            // 엑셀 뗌: 서서히 느려짐
+  v = clamp(v, -12, MAXV);
+
+  /* --- 핸들 --- */
+  keySteer += ((inp.f - inp.d) - keySteer) * Math.min(1, 7 * (.4 + .6 * G) * dt);
+  const steer = clamp(keySteer + tilt, -1, 1);
+  steerNow = steer;
+  const sd = steer > .35 ? 1 : steer < -.35 ? -1 : 0;
+  if (sd !== lastS){ if (sd !== 0) steerFx(sd); lastS = sd; }
+
+  const sp = clamp(v / 25, -1, 1), vfp = Math.max(0, v) / MAXV;
+  x += steer * 1.5 * (.35 + .65 * G) * sp * dt / Wf;
+  x -= curveAt(z) * vfp * dt / Wf;                            // 커브 바깥쪽으로 밀림
+  if (cfg.ice) x += Math.sin(gameT * 1.3 + seed1) * .25 * dt * vfp;   // 빙판: 차가 스르륵 미끄러짐
+  z += v * dt; if (z < 0) z = 0;
+
+  if (Math.abs(x) >= 1){ if (hit('벽에 부딪혔습니다.')) return; x = clamp(x, -.98, .98); }
+
+  /* --- 스테이지 넘어감 / 거리 안내 --- */
+  const stNow = stageAt(z);
+  if (stNow > curStage){ const prev = curStage; curStage = stNow; lastMk = 0; hearts = maxHearts(curStage); invT = 0; stageClear(prev); }
+  const mk = Math.floor((z - (curStage - 1) * 1000) / 250);
+  if (mk !== lastMk){ lastMk = mk; if (mk > 0) sayIdle((mk * 250) + '미터'); }
+
+  /* --- 구간(어린이 보호구역/공사/고가도로/터널) --- */
+  const act = {};
+  let lim = null;
+  for (const g of segs){
+    const inside = z >= g.a && z <= g.b;
+    if (inside && !g.in){
+      g.in = true;
+      if (g.kind === 'school'){ jingle([784, 659, 523], .16, 'sine', .4); say('어린이 보호구역입니다. 시속 ' + g.kmh + '킬로미터 이하로 달리세요.'); }
+      else if (g.kind === 'work'){ jingle([440, 440, 440], .12, 'square', .3); say('공사 구간입니다. 시속 ' + g.kmh + '킬로미터 제한입니다.'); }
+      else if (g.kind === 'over'){ jingle([262, 196], .18, 'triangle', .4); say('고가도로입니다. 옆바람과 이음매에 주의하세요.'); }
+      else if (g.kind === 'tunnel'){ jingle([330, 262, 196], .16, 'triangle', .4); say('터널입니다.'); }
+    } else if (!inside && g.in && z > g.b){
+      g.in = false; jingle([523, 659], .12, 'sine', .3);
+      say(g.kind === 'school' || g.kind === 'work' ? '구역이 끝났습니다. 속도 제한이 풀렸습니다.' : '구간이 끝났습니다.');
+    }
+    if (inside){ act[g.kind] = true; if (g.v) lim = g; }
+  }
+  fx.rain = !!cfg.rain; fx.ice = !!cfg.ice;
+  fx.echo = (act.over || act.tunnel) ? 1 : 0;
+  fx.dark = act.tunnel ? .5 : 0;
+
+  /* --- 속도 제한 --- */
+  if (lim){
+    if (v > lim.v + 1.2){
+      overT += dt;
+      limT -= dt; if (limT <= 0){ limT = .8; beep(1500, .09, 0, 'square', .3); }
+      limSayT -= dt; if (limSayT <= 0){ limSayT = 4; say('속도를 줄이세요. 제한 시속 ' + lim.kmh + '킬로미터'); }
+      if (overT >= 5){ if (hit('과속으로 사고가 났습니다.')) return; }
+    } else overT = Math.max(0, overT - dt * .5);
+  } else overT = 0;
+
+  /* --- 구간 분위기 소리 --- */
+  if (act.school){
+    kidT -= dt;
+    if (kidT <= 0){
+      kidT = rnd(1.1, 2.6);
+      const pan = rnd(-1, 1), f0 = rnd(1000, 1700);
+      beep(f0, .07, pan, 'sine', .14); setTimeout(() => beep(f0 * 1.3, .06, pan, 'sine', .12), 90);
+    }
+  }
+  if (act.work){
+    hamT -= dt;
+    if (hamT <= 0){
+      hamT = rnd(.6, 1.4);
+      const pan = (Math.random() < .5 ? -1 : 1) * .8;
+      beep(1100, .03, pan, 'square', .2); beep(160, .08, pan, 'triangle', .25);
+    }
+  }
+  if (act.over){
+    const jn = Math.floor(z / 25);
+    if (jn !== lastJn){ lastJn = jn; if (v > 6){ beep(75, .09, 0, 'sine', .5); setTimeout(() => beep(75, .09, 0, 'sine', .4), 110); vib([25]); } }
+    if (v > 8 && !gust.on){ gustT -= dt; if (gustT <= 0){ gust.on = true; gust.t = 0; gust.d = Math.random() < .5 ? -1 : 1; } }
+  }
+  if (gust.on){
+    gust.t += dt;
+    const t = gust.t;
+    fx.gust = t < .6 ? t / .6 : (t < 1.8 ? 1 : Math.max(0, 1 - (t - 1.8) / .4));
+    fx.gustPan = -gust.d;                                      // 바람이 불어오는 쪽 귀에서 소리
+    if (t >= .6 && t < 1.8) x += gust.d * .9 * dt * (.4 + .6 * vfp);
+    if (t >= 2.2){ gust.on = false; gustT = rnd(2.5, 5); fx.gust = 0; }
+  } else fx.gust = 0;
+  if (cfg.rain){ thunderT -= dt; if (thunderT <= 0){ thunder(); thunderT = rnd(12, 24); } }
+
+  /* --- 횡단보도: 보행자 3명이 동시에, 각자 불규칙하게 건넌다 --- */
+  for (const c of crosswalks){
+    const dz = c.z - z;
+    if (dz > 0 && dz < 140 && !c.ann){ c.ann = true; jingle([660, 660], .12, 'sine', .3); say('전방 횡단보도'); }
+    if (c.st === 0 && c.active && dz > 0 && dz < 115){
+      c.st = 1; c.t = 0; c.peds = [];
+      for (let i = 0; i < 3; i++){
+        const dir = Math.random() < .5 ? -1 : 1;
+        c.peds.push({ dir, p:-dir * 1.65, s0:c.child ? rnd(.35, .6) : rnd(.5, .9), f1:rnd(1.5, 3.5), ph:rnd(0, 6.3),
+          startDz:rnd(75, 112), on:false, t:0, pause:0, pauses:0, dash:0, turned:false, entered:false, done:false,
+          tMax:c.child ? 22 : 16, sT:0, pitch:rnd(.85, 1.2) });
+      }
+      say(c.child ? '아이들 세 명이 길을 건너고 있어요. 멈추세요.' : '보행자 세 명이 건너고 있습니다. 멈추세요.');
+    }
+    if (c.st === 1){
+      c.t += dt;
+      const near = clamp(1 - Math.abs(dz) / 130, .12, 1);
+      c.bT -= dt; if (c.bT <= 0){ c.bT = .5; beep(1760, .06, 0, 'sine', .2 * near); }                 // 보행자 신호음
+      let onRoad = false, allDone = true;
+      for (const q of c.peds){
+        pedStep(q, dt, dz);
+        if (!q.done) allDone = false;
+        if (!q.on || q.done) continue;
+        if (Math.abs(q.p) < 1.15) onRoad = true;
+        q.sT -= dt;
+        if (q.pause > 0){ if (q.sT <= 0){ q.sT = .8; beep(110, .05, (q.p - x) * 1.2, 'sine', .14 * near); } }          // 멈춰 서 있을 땐 낮은 숨소리
+        else if (q.sT <= 0){ q.sT = (c.child ? .26 : .34) / (q.dash > 0 ? 2 : 1); beep((c.child ? 950 : 520) * q.pitch, .03, (q.p - x) * 1.2, 'square', .2 * near); }   // 발걸음
+      }
+      if (onRoad && z >= c.z - 1 && z <= c.z + 8){
+        if (hit(c.child ? '횡단보도에서 아이와 부딪혔습니다.' : '횡단보도에서 보행자와 부딪혔습니다.', () => { c.st = 2; })) return;
+      }
+      if (allDone){ c.st = 2; say('모두 건너갔습니다. 출발하세요.'); jingle([880, 1175], .1, 'sine', .3); }
+    }
+  }
+
+  /* --- 신호등 --- */
+  // 110m 안으로 들어와 달리는 동안은 신호가 바뀌지 않습니다. 그때 들은 신호가 그대로 적용됩니다.
+  // 완전히 멈추면 신호가 다시 돌아가서, 빨간불에 서 있으면 곧 초록불이 됩니다.
+  for (const l of lights){
+    const passed = l.pz < l.z && z >= l.z;
+    const dz = passed ? l.z - l.pz : l.z - z;      // 지나가는 순간에는 직전 거리로 판단
+    let stt;
+    if (dz > 0 && dz < 110 && v >= 1){
+      if (!l.hold){
+        l.hold = lightState(l);
+        say(l.hold === 'red' ? '빨간불. 멈추세요.' : '초록불. 통과하세요.');
+        l.last = l.hold;
+      }
+      stt = l.hold;
+    } else { l.hold = null; stt = lightState(l); }
+    l.cur = stt;
+    if (dz > 0 && dz < 150){
+      if (!l.ann){ l.ann = true; l.last = stt; say('전방 신호등. ' + (stt === 'red' ? '빨간불' : '초록불')); }
+      else if (stt !== l.last){
+        l.last = stt;
+        say(stt === 'red' ? '빨간불' : '초록불');
+        if (stt === 'green') jingle([880, 1175], .12, 'sine', .35); else jingle([300, 220], .14, 'square', .3);
+      }
+      if (stt === 'red'){ l.t -= dt; if (l.t <= 0){ l.t = dz < 45 ? .35 : .8; beep(210, .1, 0, 'square', dz < 45 ? .35 : .22); } }
+    }
+    l.pz = z;
+    if (passed && stt === 'red'){ if (hit('빨간불에 지나가 교차로에서 사고가 났습니다.')) return; }
+  }
+
+  /* --- 장애물 / 앞차 --- */
+  const cw = .2 / Wf;
+  const near = [];
+  for (const o of obstacles){
+    if (o.dead) continue;
+    if (o.v) o.z += o.v * dt;
+    const dz = o.z - z;
+    if (dz < -80){ o.dead = true; continue; }
+    if (Math.abs(dz) < 3 && Math.abs(o.x - x) < cw + o.w){
+      const msg = o.kind === 'car' ? '앞차와 부딪혔습니다.' : o.kind === 'stalled' ? '멈춰 있는 차와 부딪혔습니다.' : '공사 장애물에 부딪혔습니다.';
+      if (hit(msg, () => { o.dead = true; })) return;
+    }
+    if (o.beacon && dz > -6 && dz < 170) near.push(o);
+  }
+  if (obstacles.length > 40) obstacles = obstacles.filter(o => !o.dead);
+  near.sort((a, b) => a.z - b.z);
+  for (let i = 0; i < Math.min(3, near.length); i++){
+    const o = near[i], dz = Math.max(0, o.z - z), nr = 1 - dz / 170;
+    o.t -= dt;
+    if (o.t <= 0){
+      o.t = .12 + .7 * (dz / 170);
+      const pan = (o.x - x) * 2.2;
+      if (o.kind === 'cone') beep(1300, .03, pan, 'square', .1 + .22 * nr);
+      else if (o.kind === 'car') beep(150, .12, pan, 'sawtooth', .12 + .3 * nr);
+      else beep(240, .1, pan, 'triangle', .12 + .3 * nr);
+    }
+  }
+
+  /* --- 브레이크 감각 / 후진 --- */
+  if (braking && v > 10){ brakeVibT -= dt; if (brakeVibT <= 0){ brakeVibT = .1; vib([40]); } } else brakeVibT = 0;
+  if (braking && prevV > .2 && v < .05){ beep(90, .22, 0, 'sine', .6); vib([90]); }
+  if (v < -.5){ backT -= dt; if (backT <= 0){ backT = .5; beep(1000, .17, 0, 'square', .18); } } else backT = 0;
+
+  /* --- 벽 접근 경고 / 커브 예고 --- */
+  const d = Math.abs(x);
+  if (d > 0.55){
+    warnT -= dt;
+    if (warnT <= 0){
+      const k = Math.min(1, (d - 0.55) / 0.4);
+      warnT = 0.55 - 0.45 * k;
+      beep(800 + k * 700, .07, Math.sign(x), 'square', .25);
+      vib(x < 0 ? VL : VR);
+    }
+  } else warnT = 0;
+
+  const ca = curveAt(z + 90);
+  if (Math.abs(ca) > 0.3 && v > 5){
+    curveT -= dt;
+    if (curveT <= 0){ curveT = 0.9; beep(300, .16, Math.sign(ca), 'triangle', .4); }
+  } else curveT = 0;
+}
+
+/* =====================================================================
+   그리기 (운전석 시점)
+   ===================================================================== */
+function render(){
+  const hz = Math.floor(H * 0.42), N = H - hz;
+  ctx.fillStyle = fx.rain ? '#7d8fa3' : '#6ab7ff'; ctx.fillRect(0, 0, W, hz);
+  const cwNear = crosswalks.filter(c => c.z + 8 > z && c.z < z + 800);
+  let off = 0, dx = 0;
+  const kk = 0.7 * W / (N * N);
+  for (let y = H - 1; y >= hz; y--){
+    const p = (y - hz) / N;
+    const dist = 25 / (p + 0.03) - 20;
+    const wz = z + dist;
+    dx += curveAt(wz) * kk;
+    off += dx;
+    const rw = W * (0.015 + 0.5 * p);
+    const cx = W / 2 - x * rw + off;
+    cxs[y] = cx;
+    const band = Math.floor(wz / 20) % 2 === 0;
+    ctx.fillStyle = band ? '#2e8b3d' : '#277a35'; ctx.fillRect(0, y, W, 1);
+    ctx.fillStyle = band ? '#e53935' : '#ffffff'; ctx.fillRect(cx - rw * 1.12, y, rw * 2.24, 1);
+    let roadCol = band ? '#444' : '#4d4d4d', stripe = false;
+    for (const c of cwNear){ if (wz >= c.z && wz <= c.z + 8){ stripe = true; roadCol = (Math.floor((wz - c.z) * 1.2) % 2 === 0) ? '#f2f2f2' : '#444'; } }
+    ctx.fillStyle = roadCol; ctx.fillRect(cx - rw, y, rw * 2, 1);
+    if (band && !stripe){ ctx.fillStyle = '#ddd'; ctx.fillRect(cx - rw * 0.02, y, rw * 0.04, 1); }
+  }
+
+  // 길 위의 물체들 (먼 것부터)
+  const items = [];
+  for (const o of obstacles) if (!o.dead) items.push({ dz:o.z - z, kind:'ob', o });
+  for (const c of crosswalks) if (c.st === 1) for (const q of c.peds) if (q.on && !q.done && Math.abs(q.p) < 1.7) items.push({ dz:c.z - z, kind:'ped', o:q, child:c.child });
+  for (const l of lights) items.push({ dz:l.z - z, kind:'light', o:l });
+  items.sort((a, b) => b.dz - a.dz);
+  for (const it of items){
+    const p = 25 / (it.dz + 20) - .03;
+    if (p <= .02 || p >= 1) continue;
+    const y = hz + Math.round(p * N); if (y < hz || y >= H) continue;
+    const rw = W * (.015 + .5 * p), cx = cxs[y];
+    if (it.kind === 'ob'){
+      const o = it.o;
+      ctx.fillStyle = o.kind === 'cone' ? '#ff7a00' : o.kind === 'car' ? '#2979ff' : '#9e9e9e';
+      const wd = rw * o.w * 2, ht = o.kind === 'cone' ? rw * .3 : rw * .42;
+      ctx.fillRect(cx + o.x * rw - wd / 2, y - ht, wd, ht);
+    } else if (it.kind === 'ped'){
+      const q = it.o, ht = rw * (it.child ? .28 : .4), wd = rw * .1;
+      ctx.fillStyle = '#ffd54f'; ctx.fillRect(cx + q.p * rw - wd / 2, y - ht, wd, ht);
+    } else {
+      const l = it.o, r2 = Math.max(3, rw * .08);
+      ctx.fillStyle = (l.cur || lightState(l)) === 'red' ? '#ff1744' : '#00e676';
+      ctx.beginPath(); ctx.arc(cx - rw * 1.35, y - rw * .5, r2, 0, 6.3); ctx.fill();
+    }
+  }
+
+  if (fx.rain){
+    ctx.strokeStyle = 'rgba(200,220,255,.45)'; ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i < 70; i++){ const rx = Math.random() * W, ry = Math.random() * H; ctx.moveTo(rx, ry); ctx.lineTo(rx - 4, ry + 14); }
+    ctx.stroke();
+  }
+  if (fx.dark > 0){ ctx.fillStyle = 'rgba(0,0,0,' + fx.dark + ')'; ctx.fillRect(0, 0, W, H); }
+}
+
+let last = performance.now();
+function loop(t){
+  const dt = Math.min(.05, (t - last) / 1000); last = t;
+  if (state === 'play') update(dt);
+  updateAudio(dt);
+  render();
+  hud.textContent = '스테이지 ' + curStage + ' · ' + Math.round(Math.abs(v) * KMH) + ' km/h · ' + Math.max(0, Math.floor(z - (curStage - 1) * 1000)) + ' / 1000 m · 하트 ' + hearts + (invT > 0 ? ' (무적)' : '');
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
